@@ -5,12 +5,15 @@
 #
 # Installs the `collect-activity` CLI into ~/.local/bin — and the `transcripts` CLI it reads
 # agent sessions through (github.com/ohmaseclaro/transcripts), whenever that one is missing or
-# too old, by running its own installer. One command, both tools ready.
+# too old, by running its own installer. If Claude Code or Cursor is present, also installs the
+# `activity-report` agent skill, so your agent reaches for the bundle when you ask "what did I
+# work on?". One command, everything ready.
 #
 # Knobs (env):
 #   COLLECT_ACTIVITY_BIN=~/bin      where to put the CLI       (default ~/.local/bin)
 #   COLLECT_ACTIVITY_REF=v1.0.0     branch/tag to install      (default main)
 #   COLLECT_ACTIVITY_REPO=you/fork  source repo                (default ohmaseclaro/collect-activity)
+#   COLLECT_ACTIVITY_NO_SKILL=1     CLI only, skip the agent skill
 #   TRANSCRIPTS_*                   forwarded to the transcripts installer
 set -eu
 
@@ -18,6 +21,7 @@ REPO="${COLLECT_ACTIVITY_REPO:-ohmaseclaro/collect-activity}"
 REF="${COLLECT_ACTIVITY_REF:-main}"
 BASE="https://raw.githubusercontent.com/$REPO/$REF"
 BIN="${COLLECT_ACTIVITY_BIN:-$HOME/.local/bin}"
+SKILL="activity-report"
 NEED_TRANSCRIPTS="1.11.0"
 
 say()  { printf '%s\n' "$*"; }
@@ -39,6 +43,20 @@ mkdir -p "$BIN"
 fetch collect-activity "$BIN/collect-activity"
 chmod +x "$BIN/collect-activity"
 say "✔ installed $BIN/collect-activity"
+
+# ---------------------------------------------------------------------------- agent skill
+if [ "${COLLECT_ACTIVITY_NO_SKILL:-0}" != "1" ]; then
+  installed_skill=0
+  for root in "$HOME/.claude/skills" "$HOME/.cursor/skills"; do
+    parent="$(dirname "$root")"
+    [ -d "$parent" ] || continue          # that agent isn't installed here
+    mkdir -p "$root/$SKILL"
+    fetch "skill/$SKILL/SKILL.md" "$root/$SKILL/SKILL.md"
+    say "✔ installed skill $root/$SKILL"
+    installed_skill=1
+  done
+  [ "$installed_skill" = 1 ] || say "·  no ~/.claude or ~/.cursor found — skipped the agent skill"
+fi
 
 # ---------------------------------------------------------------------------- transcripts
 # collect-activity refuses to run without transcripts >= $NEED_TRANSCRIPTS, so make sure it is

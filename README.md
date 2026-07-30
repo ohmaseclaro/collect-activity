@@ -30,14 +30,14 @@ One self-contained bash script with an embedded Python core, same shape as its s
 curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/collect-activity/main/install.sh | sh
 ```
 
-That installs `collect-activity` into `~/.local/bin` — **and installs [`transcripts`](https://github.com/ohmaseclaro/transcripts) from GitHub when it is missing or too old**, so both tools are ready before the first run. Prefer to read before you pipe? [`install.sh`](install.sh) is 60 lines. Or by hand:
+That installs `collect-activity` into `~/.local/bin` — **and installs [`transcripts`](https://github.com/ohmaseclaro/transcripts) from GitHub when it is missing or too old**, so both tools are ready before the first run. If Claude Code or Cursor is present, it also installs the [`activity-report`](skill/activity-report/SKILL.md) agent skill — so your agent runs the bundle and reads it project by project when you say *"what did I work on yesterday?"*. Prefer to read before you pipe? [`install.sh`](install.sh) is 80 lines. Or by hand:
 
 ```sh
 git clone https://github.com/ohmaseclaro/collect-activity.git
 ./collect-activity/collect-activity --install    # symlinks into ~/.local/bin, adds it to PATH
 ```
 
-Installer knobs: `COLLECT_ACTIVITY_BIN` (install dir), `COLLECT_ACTIVITY_REF` (branch/tag), `TRANSCRIPTS_*` (forwarded to the transcripts installer).
+Installer knobs: `COLLECT_ACTIVITY_BIN` (install dir), `COLLECT_ACTIVITY_REF` (branch/tag), `COLLECT_ACTIVITY_NO_SKILL=1` (CLI only), `TRANSCRIPTS_*` (forwarded to the transcripts installer).
 
 ## Privacy
 
