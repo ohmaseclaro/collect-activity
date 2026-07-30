@@ -14,8 +14,9 @@ sessions and resolves real chat-window titles.
 - One self-contained bash script with an embedded Python core, same shape as `transcripts`.
 - `install.sh` installs `transcripts` from GitHub when missing or older than the required
   version, so one command readies both tools — and, when Claude Code or Cursor is present,
-  the `activity-report` agent skill ("what did I work on yesterday?" → run the bundle,
-  read it project by project, report).
+  the `activity-report` agent skill: run the bundle for any window (a day, a sprint, a month),
+  read it project by project, and organize the findings — shipped / in flight / decided,
+  cross-project themes, loose ends ranked for pickup.
 - Git side as before: per-repo commits (message, stat, patch with lockfiles excluded),
   uncommitted state, stashes, recent branches; nested repos and submodules included;
   `--author mine` filters to the repo's local identity.

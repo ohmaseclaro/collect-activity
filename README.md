@@ -30,7 +30,7 @@ One self-contained bash script with an embedded Python core, same shape as its s
 curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/collect-activity/main/install.sh | sh
 ```
 
-That installs `collect-activity` into `~/.local/bin` — **and installs [`transcripts`](https://github.com/ohmaseclaro/transcripts) from GitHub when it is missing or too old**, so both tools are ready before the first run. If Claude Code or Cursor is present, it also installs the [`activity-report`](skill/activity-report/SKILL.md) agent skill — so your agent runs the bundle and reads it project by project when you say *"what did I work on yesterday?"*. Prefer to read before you pipe? [`install.sh`](install.sh) is 80 lines. Or by hand:
+That installs `collect-activity` into `~/.local/bin` — **and installs [`transcripts`](https://github.com/ohmaseclaro/transcripts) from GitHub when it is missing or too old**, so both tools are ready before the first run. If Claude Code or Cursor is present, it also installs the [`activity-report`](skill/activity-report/SKILL.md) agent skill — so your agent runs the bundle and organizes the findings when you ask for a standup, a weekly review, or *"what should I pick up next?"*. Prefer to read before you pipe? [`install.sh`](install.sh) is 80 lines. Or by hand:
 
 ```sh
 git clone https://github.com/ohmaseclaro/collect-activity.git
