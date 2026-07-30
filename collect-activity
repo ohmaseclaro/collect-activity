@@ -1,0 +1,613 @@
+#!/usr/bin/env bash
+# collect-activity — bundle everything you did in a time window: git commits, uncommitted
+# state, files touched, and what you told your AI agents. One markdown file per concern per
+# project, plus a manifest.json describing what was found.
+#
+# The split is deliberate: bundles are written for a reader with a context budget — a model
+# generating a standup report, or a human catching up. It opens one project at a time instead
+# of swallowing every diff and transcript at once.
+#
+# Two sources, one owner each:
+#   git           commits (message, stat, patch), uncommitted diffs, stashes, recent branches —
+#                 straight from git, for every repo under each project, nested ones included
+#   transcripts   Claude Code, Claude Cowork, Cursor app and cursor-agent sessions, read through
+#                 the `transcripts` CLI (github.com/ohmaseclaro/transcripts), which owns store
+#                 discovery, project attribution and message extraction
+#
+# Usage:  (value flags accept both forms: --flag value and --flag=value)
+#   collect-activity --since 24h                  # everything you touched today
+#   collect-activity --since 3d --root ~/code     # projects = immediate subdirs of the root
+#   collect-activity --since "2026-07-22 15:35" --until "2026-07-23 15:35"
+#   collect-activity --projects api,web           # just these projects, skip change detection
+#   collect-activity --author all                 # everyone's commits, not just yours
+#   collect-activity --subagents                  # include subagent/background agent runs
+#   collect-activity --out /tmp/bundle            # default: <tmpdir>/collect-activity-<window>
+#   collect-activity --install                    # symlink into ~/.local/bin + add to PATH
+#
+# The root: --root, or export COLLECT_ACTIVITY_ROOT=~/code. Its immediate subdirectories are
+# the projects. A project counts as touched when any file in it was modified inside the window
+# (build output and dependency caches are pruned — their mtimes track builds, not work).
+#
+# Bundle layout:
+#   manifest.json                    window, per-project inventory, file map, warnings
+#   projects/<name>/files.md         files touched, newest first
+#   projects/<name>/commits.md       every commit: message, stat, patch (lockfiles excluded)
+#   projects/<name>/worktree.md      branch, status, staged/unstaged diffs, stashes
+#   projects/<name>/transcripts.md   agent sessions distilled to intent + prose
+#
+# Tuning: --max-patch-lines N (400) · --max-transcript-chars N (24000) · --max-files N (300)
+set -u
+
+VERSION="1.0.0"
+SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
+
+command -v python3 >/dev/null 2>&1 || { echo "collect-activity: python3 required (macOS: xcode-select --install)"; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "collect-activity: git required"; exit 1; }
+
+# print the header comment block, however long it grows
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SELF"; }
+
+do_install() {
+  local dest="$HOME/.local/bin/collect-activity"
+  mkdir -p "$HOME/.local/bin"
+  chmod +x "$SELF"
+  if [ "$SELF" != "$dest" ]; then ln -sf "$SELF" "$dest"; fi
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+      for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+        [ -f "$rc" ] || [ "$rc" = "$HOME/.zshrc" ] || continue
+        if ! grep -qs 'collect-activity-path' "$rc" && ! grep -qs '\.local/bin' "$rc"; then
+          printf '\nexport PATH="$HOME/.local/bin:$PATH" # added by collect-activity-path\n' >> "$rc"
+          echo "added ~/.local/bin to PATH in $rc"
+        fi
+      done
+      ;;
+  esac
+  echo "installed: $dest -> $SELF"
+  echo "open a new shell (or: export PATH=\"\$HOME/.local/bin:\$PATH\") and run: collect-activity --help"
+}
+
+case "${1:-}" in
+  --version) echo "collect-activity $VERSION"; exit 0 ;;
+  -h|--help) usage; exit 0 ;;
+  --install) do_install; exit $? ;;
+esac
+
+# transcripts is not optional — it is the only reader of agent-transcript stores this tool has.
+NEED_TRANSCRIPTS="1.11.0"   # --dir scoping and --details --json first shipped here
+if ! command -v transcripts >/dev/null 2>&1; then
+  echo "collect-activity: the transcripts CLI is required and was not found." >&2
+  echo "install it:  curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/transcripts/main/install.sh | sh" >&2
+  exit 1
+fi
+have="$(transcripts --version 2>/dev/null | awk '{print $2}')"
+if [ "$(printf '%s\n%s\n' "$NEED_TRANSCRIPTS" "${have:-0}" | sort -V | head -n1)" != "$NEED_TRANSCRIPTS" ]; then
+  echo "collect-activity: transcripts >= $NEED_TRANSCRIPTS required (found ${have:-unknown})." >&2
+  echo "update it:   curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/transcripts/main/install.sh | sh" >&2
+  exit 1
+fi
+
+export CA_VERSION="$VERSION"
+exec python3 - "$@" <<'PYCODE'
+import argparse, json, math, os, re, subprocess, sys, tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+VERSION = os.environ.get("CA_VERSION", "?")
+
+# ---------------------------------------------------------------- defaults
+# Never walked into: build output and dependency caches — their mtimes track builds, not work.
+PRUNE_DIRS = {
+    "node_modules", ".git", "dist", "build", ".next", ".turbo", ".nx",
+    "target", "venv", ".venv", "__pycache__", ".cache", "coverage",
+    ".terraform", "vendor", ".husky",
+}
+
+# Files that never count as activity. Finder droppings only — planning docs, lockfiles and
+# generated code DO count as "I worked on this project".
+EXCLUDE_FILES = {".DS_Store"}
+
+# Kept out of patch *bodies* only. They still appear in --stat and still count as changes;
+# it's just that a 6000-line lockfile diff tells the reader nothing.
+PATCH_EXCLUDE = [
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock",
+    "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum", "uv.lock",
+    "*.min.js", "*.min.css", "*.snap", "*.map", "*.svg", "*.lock",
+]
+
+DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([mhdw])\s*$", re.IGNORECASE)
+UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+RECORD_SEP = "\x1e"
+COMMIT_SEP = "\x1d"
+LOG_FORMAT = RECORD_SEP.join(["%H", "%h", "%an", "%ae", "%aI", "%s", "%b"]) + COMMIT_SEP
+
+WARNINGS: list[str] = []
+
+def warn(msg: str) -> None:
+    WARNINGS.append(msg)
+    print(f"  ! {msg}", file=sys.stderr)
+
+# ---------------------------------------------------------------- time window
+def parse_point(value: str, now: datetime) -> datetime:
+    """Parse an absolute time. Accepts ISO-ish forms, naive or offset-aware."""
+    v = value.strip().replace("/", "-")
+    if v.lower() == "now":
+        return now
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M",
+                "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(v, fmt).astimezone()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        raise SystemExit(f"could not parse time: {value!r} — use 24h / 3d / 90m, "
+                         "or '2026-07-22 15:35'")
+
+def parse_window(since: str, until: str | None, now: datetime) -> tuple[datetime, datetime]:
+    end = parse_point(until, now) if until else now
+    m = DURATION_RE.match(since)
+    if m:
+        seconds = float(m.group(1)) * UNIT_SECONDS[m.group(2).lower()]
+        return end - timedelta(seconds=seconds), end
+    start = parse_point(since, now)
+    if start > end:
+        raise SystemExit("window start is after window end")
+    return start, end
+
+def stamp(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d-%H-%M-%S")
+
+def parse_ts(value) -> datetime | None:
+    """Transcript timestamps are usually UTC ISO with a Z. Convert to local."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+# ---------------------------------------------------------------- filesystem discovery
+def walk(root: Path):
+    """os.walk with the prune list applied. Yields (dirpath, dirnames, filenames)."""
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda e: None):
+        dirnames[:] = sorted(d for d in dirnames if d not in PRUNE_DIRS)
+        yield Path(dirpath), dirnames, filenames
+
+def changed_files(project: Path, start_ts: float, end_ts: float, cap: int) -> tuple[list[tuple[str, float]], int]:
+    """Files whose mtime falls inside the window. Returns (sample, total_count).
+
+    Exact timestamps rather than `find -mtime -1` day granularity, so windows like
+    "since 15:35" mean what they say.
+    """
+    hits: list[tuple[str, float]] = []
+    total = 0
+    for dirpath, _dirnames, filenames in walk(project):
+        for name in filenames:
+            if name in EXCLUDE_FILES:
+                continue
+            path = dirpath / name
+            try:
+                mtime = path.lstat().st_mtime
+            except OSError:
+                continue
+            if start_ts <= mtime <= end_ts:
+                total += 1
+                if len(hits) < cap:
+                    try:
+                        rel = str(path.relative_to(project))
+                    except ValueError:
+                        rel = str(path)
+                    hits.append((rel, mtime))
+    hits.sort(key=lambda h: h[1], reverse=True)
+    return hits, total
+
+def find_repos(project: Path) -> list[Path]:
+    """Every git repo under the project, including nested ones and submodules."""
+    repos: list[Path] = []
+    for dirpath, dirnames, filenames in walk(project):
+        # `.git` is a directory normally, a file in submodules and worktrees.
+        if ".git" in filenames or (dirpath / ".git").exists():
+            repos.append(dirpath)
+    return sorted(set(repos))
+
+# ---------------------------------------------------------------- git
+def git(repo: Path, *args: str, timeout: int = 120) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "--no-pager", *args],
+            capture_output=True, text=True, timeout=timeout, errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        warn(f"git timed out in {repo}: {' '.join(args[:2])}")
+        return ""
+    except OSError as exc:
+        warn(f"git failed in {repo}: {exc}")
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+def exclude_pathspecs() -> list[str]:
+    return [f":(exclude,glob)**/{g}" for g in PATCH_EXCLUDE] + \
+           [f":(exclude,glob){g}" for g in PATCH_EXCLUDE]
+
+def local_identity(repo: Path) -> list[str]:
+    ids = []
+    for key in ("user.email", "user.name"):
+        value = git(repo, "config", "--get", key).strip()
+        if value:
+            ids.append(value)
+    return ids
+
+def truncate_lines(text: str, limit: int, label: str) -> str:
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text
+    kept = "\n".join(lines[:limit])
+    return f"{kept}\n... [{label} truncated: {len(lines) - limit} more lines]"
+
+def collect_commits(repo: Path, start: datetime, end: datetime,
+                    author_mode: str, max_patch_lines: int) -> tuple[list[dict], int]:
+    """Commits in the window. Returns (commits, count_skipped_by_author_filter)."""
+    base = ["log", "--all", "--date-order",
+            f"--since={start.isoformat()}", f"--until={end.isoformat()}"]
+
+    authors: list[str] = []
+    if author_mode == "mine":
+        authors = local_identity(repo)
+        if not authors:
+            warn(f"no git identity configured in {repo}; including all authors")
+
+    total_raw = git(repo, *base, "--pretty=format:%H").strip()
+    total_count = len(total_raw.splitlines()) if total_raw else 0
+
+    args = base + [f"--pretty=format:{LOG_FORMAT}"]
+    for author in authors:
+        args.append(f"--author={author}")
+
+    raw = git(repo, *args)
+    commits: list[dict] = []
+    for chunk in raw.split(COMMIT_SEP):
+        chunk = chunk.strip("\n")
+        if not chunk.strip():
+            continue
+        parts = chunk.split(RECORD_SEP)
+        if len(parts) < 6:
+            continue
+        full, short, author_name, author_email, when, subject = parts[:6]
+        body = parts[6].strip() if len(parts) > 6 else ""
+
+        stat = git(repo, "show", full, "--stat", "--format=", "-M", "--no-color").strip()
+        patch = git(repo, "show", full, "--patch", "--format=", "-M", "--no-color",
+                    "--", ".", *exclude_pathspecs()).strip()
+
+        commits.append({
+            "hash": full,
+            "short": short,
+            "author": f"{author_name} <{author_email}>",
+            "date": when,
+            "subject": subject,
+            "body": body,
+            "stat": stat,
+            "patch": truncate_lines(patch, max_patch_lines, "patch"),
+        })
+
+    skipped = max(0, total_count - len(commits))
+    return commits, skipped
+
+def collect_worktree(repo: Path, max_patch_lines: int) -> dict:
+    """Uncommitted state. This is where 'still in progress' actually lives."""
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    status = git(repo, "status", "--porcelain=v1", "-uall").strip()
+    tracking = git(repo, "rev-list", "--left-right", "--count", "@{u}...HEAD").strip()
+
+    unstaged = git(repo, "diff", "-M", "--no-color", "--", ".", *exclude_pathspecs()).strip()
+    staged = git(repo, "diff", "--cached", "-M", "--no-color", "--", ".", *exclude_pathspecs()).strip()
+
+    stashes = git(repo, "stash", "list").strip()
+    recent_branches = git(
+        repo, "for-each-ref", "--sort=-committerdate", "--count=8",
+        "--format=%(refname:short) (%(committerdate:relative))", "refs/heads",
+    ).strip()
+
+    return {
+        "branch": branch,
+        "tracking": tracking,
+        "status": status,
+        "staged_stat": git(repo, "diff", "--cached", "--stat", "-M").strip(),
+        "unstaged_stat": git(repo, "diff", "--stat", "-M").strip(),
+        "staged_patch": truncate_lines(staged, max_patch_lines, "staged diff"),
+        "unstaged_patch": truncate_lines(unstaged, max_patch_lines, "unstaged diff"),
+        "stashes": stashes,
+        "recent_branches": recent_branches,
+    }
+
+# ---------------------------------------------------------------- transcripts CLI
+def transcripts_run(*args: str, timeout: int = 600) -> str:
+    """Call the transcripts CLI. '' on any failure — a bundle without transcripts is still a
+    bundle, and the warning ends up in the manifest."""
+    try:
+        proc = subprocess.run(["transcripts", *args], capture_output=True, text=True,
+                              timeout=timeout, errors="replace")
+    except subprocess.TimeoutExpired:
+        warn(f"transcripts timed out: {' '.join(args[:3])}")
+        return ""
+    except OSError as exc:
+        warn(f"transcripts failed to run: {exc}")
+        return ""
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        warn(f"transcripts {' '.join(args[:2])} failed: "
+             f"{tail[-1] if tail else f'exit {proc.returncode}'}")
+        return ""
+    return proc.stdout
+
+def sessions_for(project: Path, start: datetime, now: datetime, subagents: bool) -> list[dict]:
+    """Sessions that ran in this project, oldest first.
+
+    --dir owns attribution: it matches the cwd recorded inside each session and falls back to
+    decoding the slugged store-folder name — which is what correctly separates /x/api from
+    /x/api-web, and still catches sessions whose project dir was renamed since. --since is
+    mtime-based, so it is measured from now back to the window start; a session that kept
+    running past the window end is included here and trimmed to in-window messages later.
+    """
+    minutes = max(1, math.ceil((now - start).total_seconds() / 60))
+    args = ["--json", "--dir", str(project), "--since", f"{minutes}m"]
+    if subagents:
+        args.append("--subagents")
+    rows = []
+    for line in transcripts_run(*args).splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("ref"):
+            rows.append(row)
+    rows.sort(key=lambda r: r.get("updated_ts") or 0)
+    return rows
+
+def distill(row: dict, start: datetime, end: datetime, max_chars: int) -> tuple[str, int]:
+    """One session → what was asked and what the agent said. Returns (markdown, turn_count).
+
+    --details --json already did the heavy reduction: tool calls, tool results, thinking
+    blocks and image payloads are gone, leaving user turns and agent prose. This trims to the
+    window (Claude messages carry timestamps; Cursor's don't and are kept whole), caps each
+    turn — user turns get more room, they carry the intent — and elides the middle when a
+    session outgrows the budget.
+    """
+    raw = transcripts_run("--details", row["ref"], "--json")
+    try:
+        detail = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        detail = {}
+    if not detail or detail.get("error"):
+        if detail.get("error"):
+            warn(f"transcripts --details failed for {(row.get('id') or '?')[:8]}: {detail['error']}")
+        return "", 0
+
+    turns: list[str] = []
+    for msg in detail.get("messages") or []:
+        when = parse_ts(msg.get("ts"))
+        if when is not None and not (start <= when <= end):
+            continue
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        role = msg.get("role") or "?"
+        limit = 2000 if role == "user" else 900
+        if len(text) > limit:
+            text = text[:limit] + " ...[truncated]"
+        prefix = when.strftime("%H:%M") if when else "--:--"
+        turns.append(f"**{role} {prefix}** - {text}")
+    if not turns:
+        return "", 0
+
+    rendered = "\n\n".join(turns)
+    if len(rendered) > max_chars:
+        keep = max(3, len(turns) // 4)
+        elided = len(turns) - 2 * keep
+        if elided > 0:
+            rendered = ("\n\n".join(turns[:keep])
+                        + f"\n\n... [{elided} turns elided] ...\n\n"
+                        + "\n\n".join(turns[-keep:]))
+        if len(rendered) > max_chars:
+            rendered = rendered[:max_chars] + "\n... [truncated]"
+    if detail.get("truncated"):
+        rendered = "_a longer history exists before what is shown here_\n\n" + rendered
+    return rendered, len(turns)
+
+# ---------------------------------------------------------------- bundle writing
+def write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+def render_commits(project_name: str, repos: list[dict]) -> str:
+    out = [f"# Commits - {project_name}\n"]
+    for repo in repos:
+        out.append(f"\n## repo: {repo['rel']}\n")
+        if repo["skipped"]:
+            out.append(f"_{repo['skipped']} commit(s) by other authors not shown._\n")
+        if not repo["commits"]:
+            out.append("_No commits in window._\n")
+            continue
+        for commit in repo["commits"]:
+            out.append(f"\n### `{commit['short']}` {commit['subject']}")
+            out.append(f"- author: {commit['author']}")
+            out.append(f"- date: {commit['date']}")
+            if commit["body"]:
+                out.append(f"\n{commit['body']}\n")
+            if commit["stat"]:
+                out.append(f"\n```\n{commit['stat']}\n```")
+            if commit["patch"]:
+                out.append(f"\n```diff\n{commit['patch']}\n```")
+    return "\n".join(out) + "\n"
+
+def render_worktree(project_name: str, repos: list[dict]) -> str:
+    out = [f"# Uncommitted state - {project_name}\n",
+           "_Work in progress lives here. Cross-check against commits before "
+           "calling something finished._\n"]
+    for repo in repos:
+        wt = repo["worktree"]
+        out.append(f"\n## repo: {repo['rel']}")
+        out.append(f"- branch: `{wt['branch']}`")
+        if wt["tracking"]:
+            out.append(f"- behind/ahead of upstream: `{wt['tracking']}`")
+        if wt["recent_branches"]:
+            out.append(f"\nRecently active branches:\n```\n{wt['recent_branches']}\n```")
+        if wt["stashes"]:
+            out.append(f"\nStashes:\n```\n{wt['stashes']}\n```")
+        if not wt["status"]:
+            out.append("\n_Clean working tree._")
+            continue
+        out.append(f"\nStatus:\n```\n{wt['status']}\n```")
+        for label, stat, patch in (
+            ("Staged", wt["staged_stat"], wt["staged_patch"]),
+            ("Unstaged", wt["unstaged_stat"], wt["unstaged_patch"]),
+        ):
+            if stat:
+                out.append(f"\n{label}:\n```\n{stat}\n```")
+            if patch:
+                out.append(f"\n```diff\n{patch}\n```")
+    return "\n".join(out) + "\n"
+
+def render_files(project_name: str, files: list[tuple[str, float]], total: int) -> str:
+    out = [f"# Files touched - {project_name}\n",
+           f"_{total} file(s) modified in window; showing {len(files)}, newest first._\n"]
+    for rel, mtime in files:
+        out.append(f"- `{rel}` ({datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')})")
+    return "\n".join(out) + "\n"
+
+# ---------------------------------------------------------------- main
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="collect-activity", add_help=False)
+    parser.add_argument("--since", default="24h")
+    parser.add_argument("--until", default=None)
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--author", choices=["mine", "all"], default="mine")
+    parser.add_argument("--projects", default=None)
+    parser.add_argument("--subagents", action="store_true")
+    parser.add_argument("--max-patch-lines", type=int, default=400)
+    parser.add_argument("--max-transcript-chars", type=int, default=24000)
+    parser.add_argument("--max-files", type=int, default=300)
+    args = parser.parse_args()
+
+    now = datetime.now().astimezone()
+    start, end = parse_window(args.since, args.until, now)
+    start_ts, end_ts = start.timestamp(), end.timestamp()
+
+    root_arg = args.root or os.environ.get("COLLECT_ACTIVITY_ROOT")
+    if not root_arg:
+        raise SystemExit("collect-activity: no root — pass --root DIR or export "
+                         "COLLECT_ACTIVITY_ROOT=DIR (its immediate subdirectories are the projects)")
+    root = Path(os.path.expanduser(root_arg)).resolve()
+    if not root.is_dir():
+        raise SystemExit(f"root not found: {root}")
+
+    label = f"{stamp(start)}-to-{stamp(end)}"
+    out_dir = Path(os.path.expanduser(args.out)) if args.out else \
+        Path(tempfile.gettempdir()) / f"collect-activity-{label}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tr_version = transcripts_run("--version").strip()
+
+    print(f"Window: {start:%Y-%m-%d %H:%M:%S} -> {end:%Y-%m-%d %H:%M:%S}")
+    print(f"Root:   {root}")
+
+    # 1. Which projects were touched?
+    candidates = sorted(d for d in root.iterdir()
+                        if d.is_dir() and not d.name.startswith("."))
+    if args.projects:
+        wanted = {n.strip() for n in args.projects.split(",") if n.strip()}
+        candidates = [d for d in candidates if d.name in wanted]
+
+    projects: list[Path] = []
+    file_data: dict[str, tuple[list[tuple[str, float]], int]] = {}
+    for candidate in candidates:
+        files, total = changed_files(candidate, start_ts, end_ts, args.max_files)
+        if total or args.projects:
+            projects.append(candidate)
+            file_data[str(candidate)] = (files, total)
+    print(f"Projects touched: {', '.join(p.name for p in projects) or '(none)'}")
+
+    # 2. Per project: repos, commits, worktree, transcripts.
+    manifest_projects = []
+    for project in projects:
+        key = str(project)
+        print(f"\n[{project.name}]")
+        repos_meta = []
+        commit_total = 0
+        for repo in find_repos(project):
+            commits, skipped = collect_commits(repo, start, end, args.author,
+                                               args.max_patch_lines)
+            worktree = collect_worktree(repo, args.max_patch_lines)
+            dirty = bool(worktree["status"])
+            if not commits and not dirty and repo != project:
+                continue  # quiet nested repo; skip to keep the bundle readable
+            rel = str(repo.relative_to(project)) if repo != project else "."
+            repos_meta.append({"path": str(repo), "rel": rel, "commits": commits,
+                               "skipped": skipped, "worktree": worktree})
+            commit_total += len(commits)
+        print(f"  {len(repos_meta)} repo(s), {commit_total} commit(s)")
+
+        proj_dir = out_dir / "projects" / project.name
+        files, total = file_data[key]
+        write(proj_dir / "files.md", render_files(project.name, files, total))
+        if repos_meta:
+            write(proj_dir / "commits.md", render_commits(project.name, repos_meta))
+            write(proj_dir / "worktree.md", render_worktree(project.name, repos_meta))
+
+        sessions = 0
+        parts = [f"# Agent transcripts - {project.name}\n"]
+        for row in sessions_for(project, start, now, args.subagents):
+            text, count = distill(row, start, end, args.max_transcript_chars)
+            if not text:
+                continue
+            sessions += 1
+            title = row.get("title") or "untitled session"
+            parts.append(f"\n## {row.get('source', '?')} · {title}")
+            parts.append(f"_{count} message(s) in window · id `{(row.get('id') or '?')[:8]}` "
+                         f"· updated {row.get('updated', '?')}_\n")
+            parts.append(text)
+        if sessions:
+            write(proj_dir / "transcripts.md", "\n".join(parts))
+        print(f"  {sessions} transcript session(s)")
+
+        manifest_projects.append({
+            "name": project.name,
+            "path": key,
+            "files_changed": total,
+            "repos": [{"rel": r["rel"], "commits": len(r["commits"]),
+                       "dirty": bool(r["worktree"]["status"]),
+                       "branch": r["worktree"]["branch"]} for r in repos_meta],
+            "commits": commit_total,
+            "sessions": sessions,
+            "bundle": {
+                "files": f"projects/{project.name}/files.md",
+                "commits": f"projects/{project.name}/commits.md" if repos_meta else None,
+                "worktree": f"projects/{project.name}/worktree.md" if repos_meta else None,
+                "transcripts": f"projects/{project.name}/transcripts.md" if sessions else None,
+            },
+        })
+
+    manifest = {
+        "tool": f"collect-activity {VERSION}",
+        "transcripts_cli": tr_version,
+        "generated_at": now.isoformat(),
+        "window": {"start": start.isoformat(), "end": end.isoformat(), "label": label},
+        "report_filename": f"report-{label}.md",
+        "root": str(root),
+        "author_filter": args.author,
+        "projects": manifest_projects,
+        "warnings": WARNINGS,
+    }
+    write(out_dir / "manifest.json", json.dumps(manifest, indent=2))
+
+    print(f"\nBundle: {out_dir}")
+    print(f"Report filename: report-{label}.md")
+    return 0
+
+sys.exit(main())
+PYCODE
