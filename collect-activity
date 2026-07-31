@@ -40,7 +40,7 @@
 # Tuning: --max-patch-lines N (400) · --max-transcript-chars N (24000) · --max-files N (300)
 set -u
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "collect-activity: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -215,6 +215,20 @@ def find_repos(project: Path) -> list[Path]:
         if ".git" in filenames or (dirpath / ".git").exists():
             repos.append(dirpath)
     return sorted(set(repos))
+
+def is_linked_worktree(repo: Path) -> bool:
+    """A linked `git worktree` shares its main repo's history — collecting its commits again
+    would double every count and every patch in the bundle. Its checked-out branch and dirty
+    state are unique though, and still worth showing. (A submodule's `.git` file points into
+    `.git/modules/`, not `.git/worktrees/`, so it keeps its own commits.)"""
+    gitfile = repo / ".git"
+    if not gitfile.is_file():
+        return False
+    try:
+        first = gitfile.read_text(errors="replace").split("\n", 1)[0]
+    except OSError:
+        return False
+    return "/worktrees/" in first
 
 # ---------------------------------------------------------------- git
 def git(repo: Path, *args: str, timeout: int = 120) -> str:
@@ -429,6 +443,9 @@ def render_commits(project_name: str, repos: list[dict]) -> str:
     out = [f"# Commits - {project_name}\n"]
     for repo in repos:
         out.append(f"\n## repo: {repo['rel']}\n")
+        if repo.get("linked"):
+            out.append("_Linked worktree — its commits are counted in the main repo._\n")
+            continue
         if repo["skipped"]:
             out.append(f"_{repo['skipped']} commit(s) by other authors not shown._\n")
         if not repo["commits"]:
@@ -541,15 +558,16 @@ def main() -> int:
         repos_meta = []
         commit_total = 0
         for repo in find_repos(project):
-            commits, skipped = collect_commits(repo, start, end, args.author,
-                                               args.max_patch_lines)
+            linked = is_linked_worktree(repo)
+            commits, skipped = ([], 0) if linked else \
+                collect_commits(repo, start, end, args.author, args.max_patch_lines)
             worktree = collect_worktree(repo, args.max_patch_lines)
             dirty = bool(worktree["status"])
             if not commits and not dirty and repo != project:
                 continue  # quiet nested repo; skip to keep the bundle readable
             rel = str(repo.relative_to(project)) if repo != project else "."
             repos_meta.append({"path": str(repo), "rel": rel, "commits": commits,
-                               "skipped": skipped, "worktree": worktree})
+                               "skipped": skipped, "worktree": worktree, "linked": linked})
             commit_total += len(commits)
         print(f"  {len(repos_meta)} repo(s), {commit_total} commit(s)")
 
@@ -582,6 +600,7 @@ def main() -> int:
             "files_changed": total,
             "repos": [{"rel": r["rel"], "commits": len(r["commits"]),
                        "dirty": bool(r["worktree"]["status"]),
+                       "linked_worktree": r["linked"],
                        "branch": r["worktree"]["branch"]} for r in repos_meta],
             "commits": commit_total,
             "sessions": sessions,

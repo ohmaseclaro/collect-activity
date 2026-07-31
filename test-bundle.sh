@@ -25,6 +25,9 @@ echo "other" > "$DEMO/other.txt"
 git -C "$DEMO" add -A
 git -C "$DEMO" -c user.email=other@example.com -c user.name=Other commit -qm "someone elses commit"
 echo "wip" > "$DEMO/wip.txt"
+# and a linked worktree with its own dirty file — shared history must not be double-counted
+git -C "$DEMO" worktree add -q -b wt-test "$DEMO/.claude/worktrees/wt-test" >/dev/null 2>&1
+echo "wt-wip" > "$DEMO/.claude/worktrees/wt-test/wt-wip.txt"
 
 # --- a quiet project: exists, but nothing touched inside the window
 QUIET="$ROOT/quiet"
@@ -66,6 +69,8 @@ ok "dirty file shows in worktree.md"         yes "$(has "$OUT/projects/demo/work
 ok "touched file listed in files.md"         yes "$(has "$OUT/projects/demo/files.md" "feature.txt")"
 ok "in-window transcript message captured"   yes "$(has "$OUT/projects/demo/transcripts.md" "PINEAPPLE")"
 ok "out-of-window message trimmed"           no  "$(has "$OUT/projects/demo/transcripts.md" "OLDNEEDLE")"
+ok "linked worktree does not double commits" 1   "$(grep -c "add greeting feature" "$OUT/projects/demo/commits.md")"
+ok "linked worktree dirty state still shown" yes "$(has "$OUT/projects/demo/worktree.md" "wt-wip.txt")"
 
 # --author all lifts the identity filter
 OUT2="$WORK/bundle2"

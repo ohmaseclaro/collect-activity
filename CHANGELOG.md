@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1
+
+**Linked worktrees no longer double the history.**
+
+A linked `git worktree` (e.g. an agent's `.claude/worktrees/*` execution copy) shares its main
+repo's object database, so collecting its commits counted — and patched — every commit twice.
+Linked worktrees now contribute only what is genuinely theirs: the checked-out branch and any
+uncommitted state. Submodules are unaffected and keep their own commits. Found on a real
+bundle where a project reported 498 commits for a 249-commit day.
+
 ## 1.1.0
 
 **A bare `collect-activity --since 24h` works now.**
