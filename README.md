@@ -30,7 +30,7 @@ One self-contained bash script with an embedded Python core, same shape as its s
 curl -fsSL https://raw.githubusercontent.com/ohmaseclaro/collect-activity/main/install.sh | sh
 ```
 
-That installs `collect-activity` into `~/.local/bin` — **and installs [`transcripts`](https://github.com/ohmaseclaro/transcripts) from GitHub when it is missing or too old**, so both tools are ready before the first run. If Claude Code or Cursor is present, it also installs the [`activity-report`](skill/activity-report/SKILL.md) agent skill — so your agent runs the bundle and organizes the findings when you ask for a standup, a weekly review, or *"what should I pick up next?"*. Prefer to read before you pipe? [`install.sh`](install.sh) is 80 lines. Or by hand:
+That installs `collect-activity` into `~/.local/bin` — **and installs [`transcripts`](https://github.com/ohmaseclaro/transcripts) from GitHub when it is missing or too old**, so both tools are ready before the first run. If Claude Code or Cursor is present, it also installs the [`activity-report`](skill/activity-report/SKILL.md) agent skill — so your agent runs the bundle and organizes the findings when you ask for a standup, a weekly review, or *"what should I pick up next?"*. Prefer to read before you pipe? [`install.sh`](install.sh) is under 90 lines. Or by hand:
 
 ```sh
 git clone https://github.com/ohmaseclaro/collect-activity.git
@@ -68,7 +68,7 @@ collect-activity --subagents                  # include subagent/background agen
 collect-activity --out ./bundle               # default: <tmpdir>/collect-activity-<window>
 ```
 
-`--since` takes a duration (`24h`, `3d`, `90m`, `1w`) or an absolute time (`2026-07-22 15:35`); `--until` defaults to now. The root — whose immediate subdirectories are the projects — comes from `--root` or `export COLLECT_ACTIVITY_ROOT=~/code`.
+`--since` takes a duration (`24h`, `3d`, `90m`, `1w`) or an absolute time (`2026-07-22 15:35`); `--until` defaults to now. The root — whose immediate subdirectories are the projects — is `--root`, else `COLLECT_ACTIVITY_ROOT`, else the current directory: `cd` into the folder that holds your projects and a bare `collect-activity --since 24h` just works. Set `export COLLECT_ACTIVITY_ROOT=~/code` once to run it from anywhere.
 
 Sizing knobs: `--max-patch-lines` (400), `--max-transcript-chars` (24000) and `--max-files` (300) bound each commit patch, each session, and the per-project file list.
 

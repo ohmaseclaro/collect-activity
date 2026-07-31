@@ -38,9 +38,10 @@ collect-activity --since "2026-07-01"         # the month so far
 collect-activity --since "2026-07-14" --until "2026-07-28"    # a sprint
 ```
 
-The project root (its immediate subdirectories are the projects) comes from
-`COLLECT_ACTIVITY_ROOT` or `--root`. If neither is set, the tool says so — ask the user where
-their projects live rather than guessing. Useful extras: `--projects api,web` to scope,
+The project root (its immediate subdirectories are the projects) resolves `--root`, else
+`COLLECT_ACTIVITY_ROOT`, else the current directory. From an agent session, rely on the env
+var or pass `--root` explicitly — your working directory is often a single project, not the
+folder that holds all of them. If you don't know where the user's projects live, ask. Useful extras: `--projects api,web` to scope,
 `--author all` when the user asks about team activity, `--subagents` to include
 background/subagent runs.
 

@@ -72,6 +72,11 @@ OUT2="$WORK/bundle2"
 TRANSCRIPTS_HOME="$FIXHOME" "$CA" --since 1h --root "$ROOT" --out "$OUT2" --author all >/dev/null 2>&1
 ok "--author all includes the other commit"  yes "$(has "$OUT2/projects/demo/commits.md" "someone elses commit")"
 
+# bare invocation: the root defaults to the directory you stand in
+OUT3="$WORK/bundle3"
+(cd "$ROOT" && COLLECT_ACTIVITY_ROOT= TRANSCRIPTS_HOME="$FIXHOME" "$CA" --since 1h --out "$OUT3" >/dev/null 2>&1)
+ok "root defaults to the current directory"  yes "$(has "$OUT3/manifest.json" '"name": "demo"')"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

@@ -83,5 +83,5 @@ case ":$PATH:" in
 esac
 
 say ""
-say "Run it:  collect-activity --since 24h --root ~/code"
-say "         (or: export COLLECT_ACTIVITY_ROOT=~/code once, then just --since)"
+say "Run it:  cd ~/code && collect-activity --since 24h    # projects = subdirs of where you stand"
+say "         (or: export COLLECT_ACTIVITY_ROOT=~/code once, then run it from anywhere)"

@@ -24,9 +24,11 @@
 #   collect-activity --out /tmp/bundle            # default: <tmpdir>/collect-activity-<window>
 #   collect-activity --install                    # symlink into ~/.local/bin + add to PATH
 #
-# The root: --root, or export COLLECT_ACTIVITY_ROOT=~/code. Its immediate subdirectories are
-# the projects. A project counts as touched when any file in it was modified inside the window
-# (build output and dependency caches are pruned — their mtimes track builds, not work).
+# The root — whose immediate subdirectories are the projects — is --root, else
+# COLLECT_ACTIVITY_ROOT, else the current directory: run it from the folder that holds your
+# projects and it just works. A project counts as touched when any file in it was modified
+# inside the window (build output and dependency caches are pruned — their mtimes track
+# builds, not work).
 #
 # Bundle layout:
 #   manifest.json                    window, per-project inventory, file map, warnings
@@ -38,7 +40,7 @@
 # Tuning: --max-patch-lines N (400) · --max-transcript-chars N (24000) · --max-files N (300)
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || echo "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "collect-activity: python3 required (macOS: xcode-select --install)"; exit 1; }
@@ -498,10 +500,9 @@ def main() -> int:
     start, end = parse_window(args.since, args.until, now)
     start_ts, end_ts = start.timestamp(), end.timestamp()
 
-    root_arg = args.root or os.environ.get("COLLECT_ACTIVITY_ROOT")
-    if not root_arg:
-        raise SystemExit("collect-activity: no root — pass --root DIR or export "
-                         "COLLECT_ACTIVITY_ROOT=DIR (its immediate subdirectories are the projects)")
+    # Precedence: --root > COLLECT_ACTIVITY_ROOT > the directory you are standing in — so
+    # running it from the folder that holds your projects just works.
+    root_arg = args.root or os.environ.get("COLLECT_ACTIVITY_ROOT") or "."
     root = Path(os.path.expanduser(root_arg)).resolve()
     if not root.is_dir():
         raise SystemExit(f"root not found: {root}")

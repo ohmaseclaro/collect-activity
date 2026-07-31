@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0
+
+**A bare `collect-activity --since 24h` works now.**
+
+The root defaults to the current directory when neither `--root` nor `COLLECT_ACTIVITY_ROOT`
+is set — the README's own first example used to refuse to run. Run it from the folder that
+holds your projects, or set the env var once to run it from anywhere. Precedence:
+`--root` > `COLLECT_ACTIVITY_ROOT` > cwd.
+
 ## 1.0.0
 
 **First public release.**
